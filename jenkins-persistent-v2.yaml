@@ -1,0 +1,271 @@
+kind: Template
+apiVersion: template.openshift.io/v1
+labels:
+  app: jenkins
+  template: icheko-jenkins-persistent
+  template-version: '2'
+message: A Jenkins service has been created in your project.  Log into Jenkins with
+  your OpenShift account.  The tutorial at https://github.com/openshift/origin/blob/master/examples/jenkins/README.md
+  contains more information about using this template.
+metadata:
+  annotations:
+    iconClass: icon-jenkins
+    openshift.io/display-name: Jenkins Persistent v2 by icheko
+    openshift.io/provider-display-name: icheko/openshift
+    openshift.io/documentation-url: https://github.com/icheko/openshift
+    openshift.io/support-url: "mailto:jose@icheko.com"
+    description: |-
+      Jenkins service, with persistent storage and a customizable domain.
+
+    openshift.io/long-description: |-
+      This template deploys a Jenkins server capable of managing OpenShift Pipeline builds and supporting OpenShift-based oauth login.
+
+      NOTE: You must have persistent volumes available in your cluster to use this template.
+    tags: instant-app,jenkins,icheko
+  name: icheko-jenkins-persistent-v2
+  namespace: openshift
+objects:
+- apiVersion: v1
+  kind: Route
+  metadata:
+    annotations:
+      haproxy.router.openshift.io/timeout: 4m
+      template.openshift.io/expose-uri: https://{.spec.host}{.spec.path}
+    name: ${JENKINS_SERVICE_NAME}
+  spec:
+    host: ${JENKINS_SERVICE_NAME}-${JENKINS_ID}.${JENKINS_TLD}
+    tls:
+      insecureEdgeTerminationPolicy: Redirect
+      termination: edge
+    to:
+      kind: Service
+      name: ${JENKINS_SERVICE_NAME}
+- apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: ${JENKINS_SERVICE_NAME}-${JENKINS_ID}
+  spec:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: ${VOLUME_CAPACITY}
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    annotations:
+      template.alpha.openshift.io/wait-for-ready: "true"
+    name: ${JENKINS_SERVICE_NAME}
+  spec:
+    replicas: 1
+    selector:
+      name: ${JENKINS_SERVICE_NAME}
+    strategy:
+      type: Recreate
+    template:
+      metadata:
+        labels:
+          name: ${JENKINS_SERVICE_NAME}
+      spec:
+        containers:
+        - capabilities: {}
+          env:
+          - name: JENKINS_URL
+            value: ${JENKINS_SERVICE_NAME}-${JENKINS_ID}.${JENKINS_TLD}
+          - name: OPENSHIFT_ENABLE_OAUTH
+            value: ${ENABLE_OAUTH}
+          - name: OPENSHIFT_ENABLE_REDIRECT_PROMPT
+            value: "true"
+          - name: DISABLE_ADMINISTRATIVE_MONITORS
+            value: ${DISABLE_ADMINISTRATIVE_MONITORS}
+          - name: KUBERNETES_MASTER
+            value: https://kubernetes.default:443
+          - name: KUBERNETES_TRUST_CERTIFICATES
+            value: "true"
+          - name: JENKINS_SERVICE_NAME
+            value: ${JENKINS_SERVICE_NAME}
+          - name: JNLP_SERVICE_NAME
+            value: ${JNLP_SERVICE_NAME}
+          - name: ENABLE_FATAL_ERROR_LOG_FILE
+            value: ${ENABLE_FATAL_ERROR_LOG_FILE}
+          - name: INSTALL_PLUGINS
+            value: ${INSTALL_PLUGINS}
+          image: ' '
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 2
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 420
+            periodSeconds: 360
+            timeoutSeconds: 240
+          name: jenkins
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 3
+            timeoutSeconds: 240
+          resources:
+            limits:
+              memory: ${MEMORY_LIMIT}
+          securityContext:
+            capabilities: {}
+            privileged: false
+          terminationMessagePath: /dev/termination-log
+          volumeMounts:
+          - mountPath: /var/lib/jenkins
+            name: ${JENKINS_SERVICE_NAME}-data
+          - mountPath: /var/lib/jenkins/init.groovy
+            name: jenkins-post-init
+            subPath: configure-system.groovy
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        serviceAccountName: ${JENKINS_SERVICE_NAME}
+        volumes:
+        - name: ${JENKINS_SERVICE_NAME}-data
+          persistentVolumeClaim:
+            claimName: ${JENKINS_SERVICE_NAME}-${JENKINS_ID}
+        - name: jenkins-post-init
+          configMap:
+            name: jenkins-post-init-scripts-${JENKINS_ID}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - jenkins
+        from:
+          kind: ImageStreamTag
+          name: ${JENKINS_IMAGE_STREAM_TAG}
+          namespace: openshift
+        lastTriggeredImage: ""
+      type: ImageChange
+    - type: ConfigChange
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    annotations:
+      serviceaccounts.openshift.io/oauth-redirectreference.jenkins: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"${JENKINS_SERVICE_NAME}"}}'
+    name: ${JENKINS_SERVICE_NAME}
+- apiVersion: v1
+  groupNames: null
+  kind: RoleBinding
+  metadata:
+    name: ${JENKINS_SERVICE_NAME}_edit
+  roleRef:
+    name: edit
+  subjects:
+  - kind: ServiceAccount
+    name: ${JENKINS_SERVICE_NAME}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${JNLP_SERVICE_NAME}
+  spec:
+    ports:
+    - name: agent
+      nodePort: 0
+      port: 50000
+      protocol: TCP
+      targetPort: 50000
+    selector:
+      name: ${JENKINS_SERVICE_NAME}
+    sessionAffinity: None
+    type: ClusterIP
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      service.alpha.openshift.io/dependencies: '[{"name": "${JNLP_SERVICE_NAME}",
+        "namespace": "", "kind": "Service"}]'
+      service.openshift.io/infrastructure: "true"
+    name: ${JENKINS_SERVICE_NAME}
+  spec:
+    ports:
+    - name: web
+      nodePort: 0
+      port: 80
+      protocol: TCP
+      targetPort: 8080
+    selector:
+      name: ${JENKINS_SERVICE_NAME}
+    sessionAffinity: None
+    type: ClusterIP
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+    name: jenkins-post-init-scripts-${JENKINS_ID}
+  data:
+    configure-system.groovy: |-
+      import hudson.security.csrf.DefaultCrumbIssuer
+      import jenkins.model.Jenkins
+
+      location = jenkins.model.JenkinsLocationConfiguration.get();
+
+      location.setAdminAddress("${JENKINS_ADMIN_EMAIL}");
+      location.setUrl("https://${JENKINS_SERVICE_NAME}-${JENKINS_ID}.${JENKINS_TLD}/");
+      location.save();
+
+      System.out.println("Set Jenkins URL to https://${JENKINS_SERVICE_NAME}-${JENKINS_ID}.${JENKINS_TLD}/ and admin email address to ${JENKINS_ADMIN_EMAIL}");
+
+      def instance = Jenkins.instance
+      instance.setCrumbIssuer(new DefaultCrumbIssuer(false))
+      instance.save()
+
+      System.out.println("Enabled CSRF Protection");
+      System.out.println("Ran configure-system.groovy");
+      
+parameters:
+- description: The name of the OpenShift Service exposed for the Jenkins container.
+  displayName: Jenkins Service Name
+  name: JENKINS_SERVICE_NAME
+  value: jenkins
+- description: The name of the service used for master/slave communication.
+  displayName: Jenkins JNLP Service Name
+  name: JNLP_SERVICE_NAME
+  value: jenkins-jnlp
+- description: Whether to enable OAuth OpenShift integration. If false, the static
+    account 'admin' will be initialized with the password 'password'.
+  displayName: Enable OAuth in Jenkins
+  name: ENABLE_OAUTH
+  value: "true"
+- description: Maximum amount of memory the container can use.
+  displayName: Memory Limit
+  name: MEMORY_LIMIT
+  value: 1Gi
+- description: Volume space available for data, e.g. 512Mi, 2Gi.
+  displayName: Volume Capacity
+  name: VOLUME_CAPACITY
+  required: true
+  value: 1Gi
+- description: Whether to perform memory intensive, possibly slow, synchronization
+    with the Jenkins Update Center on start.  If true, the Jenkins core update monitor
+    and site warnings monitor are disabled.
+  displayName: Disable memory intensive administrative monitors
+  name: DISABLE_ADMINISTRATIVE_MONITORS
+  value: "false"
+- description: Name of the ImageStreamTag to be used for the Jenkins image.
+  displayName: Jenkins ImageStreamTag
+  name: JENKINS_IMAGE_STREAM_TAG
+  value: jenkins:2
+- description: When a fatal error occurs, an error log is created with information
+    and the state obtained at the time of the fatal error.
+  displayName: Fatal Error Log File
+  name: ENABLE_FATAL_ERROR_LOG_FILE
+  value: "false"
+- description: A custom top level domain to access the instance.
+  displayName: Jenkins Top Level Domain
+  name: JENKINS_TLD
+  required: true
+- description: A list of required plugins to install. Note that this is not a list of all installed plugins - just those that are required.
+  displayName: Jenkins Plugins
+  name: INSTALL_PLUGINS
+  value: "cloudbees-folder:6.10.0,workflow-job:2.36,branch-api:2.5.5,matrix-project:1.14,jackson2-api:2.10.1,openshift-client:1.0.32,workflow-cps:2.77,workflow-support:3.3,git:4.0.0,workflow-scm-step:2.9,subversion:2.12.2,display-url-api:2.3.2,junit:1.28,jira:3.0.11,htmlpublisher:1.21,pam-auth:1.6,script-security:1.68,ant:1.10"
+- description: Jenkins Admin Email
+  name: JENKINS_ADMIN_EMAIL
+  required: true
+- description: Unique instance ID
+  name: JENKINS_ID
+  generate: expression
+  from: "[a-z0-9]{10}"

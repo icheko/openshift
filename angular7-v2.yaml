@@ -1,0 +1,371 @@
+kind: Template
+apiVersion: template.openshift.io/v1
+labels:
+  template: icheko-angular7
+  template-version: '2'
+message: A Jenkins server will be instantiated in this project to manage
+  the Pipeline BuildConfig created by this template.  You will be able to log in to
+  it using your OpenShift user credentials.
+metadata:
+  annotations:
+    iconClass: icon-angularjs
+    openshift.io/display-name: Angular 7 App v2 by icheko
+    openshift.io/provider-display-name: icheko/openshift
+    openshift.io/documentation-url: https://github.com/icheko/openshift
+    openshift.io/support-url: "mailto:jose@icheko.com"
+    description: |-
+      Angular 7 Projects.
+
+    openshift.io/long-description: |-
+      This template configures a blue green deployment pipeline using Jenkins.
+
+      STACK: RHEL 7 / Angular 7 / Node 10
+      NOTE: You must have persistent volumes available in your cluster to use this template.
+    tags: instant-app,angular,icheko
+  name: icheko-angular7-v2
+objects:
+  - kind: BuildConfig
+    apiVersion: build.openshift.io/v1
+    metadata:
+      name: ${NAME}-bc
+      annotations:
+          description: Keeps track of changes in the application image
+    spec:
+      output:
+        to:
+          kind: ImageStreamTag
+          name: ${NAME}-is:latest
+      strategy:
+        type: Source
+        sourceStrategy:
+          from:
+            kind: ImageStreamTag
+            namespace: openshift
+            name: 'nodejs:10'
+          env:
+            - name: NODE_ENV
+              value: development
+            - name: DEV_MODE
+              value: 'true'
+      postCommit: {}
+      source:
+        type: Git
+        git:
+          uri: ${SOURCE_REPOSITORY_URL}
+          ref: ${SOURCE_REPOSITORY_REF}
+        sourceSecret:
+          name: ${SOURCE_REPOSITORY_SECRET}
+      triggers:
+        - type: ImageChange
+          imageChange: {}
+        - type: ConfigChange
+      runPolicy: Serial
+  - kind: BuildConfig
+    apiVersion: v1
+    metadata:
+      annotations:
+        description: Manages the deployment to the blue/green environments
+      name: ${NAME}-deployment-pipeline
+    spec:
+      strategy:
+        jenkinsPipelineStrategy:
+          jenkinsfile: |-
+            try {
+              timeout(time: 20, unit: 'MINUTES') {
+                  def appName="${NAME}"
+                  def project=""
+                  def tag="blue"
+                  def altTag="green"
+                  def imageStream="${appName}-is"
+
+                  node {
+                    project = env.PROJECT_NAME
+
+                    stage("Initialize") {
+                      sh "oc get route ${appName}-active-route -n ${project} -o jsonpath='{ .spec.to.name }' --loglevel=4 > activeservice"
+                      activeService = readFile('activeservice').trim()
+                      if (activeService == "${appName}-blue-svc") {
+                        tag = "green"
+                        altTag = "blue"
+                      }
+                      sh "oc get route ${appName}-${tag}-route -n ${project} -o jsonpath='{ .spec.host }' --loglevel=4 > routehost"
+                      routeHost = readFile('routehost').trim()
+                    }
+          
+                    openshift.withCluster() {
+                      openshift.withProject() {
+                        stage("Build") {
+                          echo "building tag ${tag}"
+                          def bld = openshift.startBuild("${appName}-bc")
+                          bld.untilEach {
+                            return it.object().status.phase == "Running"
+                          }
+                          bld.logs('-f')                        
+                        }
+
+                        stage("Deploy ${tag}") {
+                          openshift.tag("${imageStream}:latest", "${imageStream}:${tag}")
+                          def dc = openshift.selector('dc', "${appName}-${tag}-dc")
+                          dc.rollout().status()
+                        }
+              
+                      }
+                    }
+                  } // node
+
+                  timeout(time: 30, unit: "MINUTES") {
+                      stage("Approval") {
+                        input message: "Test deployment: http://${routeHost}. Approve?", id: "approval"
+                      }
+                  }
+
+                  node {
+                    project = env.PROJECT_NAME
+
+                    openshift.withCluster() {
+                      openshift.withProject() {
+                        stage("Go Live") {
+                          sh "oc set -n ${project} route-backends ${appName}-active-route ${appName}-${tag}-svc=100 ${appName}-${altTag}-svc=0 --loglevel=4"
+                        }
+                      }
+                    }
+                  } // node
+
+              } // timeout
+            } catch (err) {
+              echo "in catch block"
+              echo "Caught: ${err}"
+              currentBuild.result = 'FAILURE'
+              throw err
+            }
+        type: JenkinsPipeline
+      triggers:
+      - github:
+          secret: "${GITHUB_WEBHOOK_SECRET}"
+        type: GitHub
+      - generic:
+          secret: "${GENERIC_WEBHOOK_SECRET}"
+        type: Generic
+  - kind: Route
+    apiVersion: v1
+    metadata:
+      name: ${NAME}-blue-route
+    spec:
+      host: ${NAME}-blue-route-${UNIQUE_ID}.${APP_TLD}
+      to:
+        kind: Service
+        name: ${NAME}-blue-svc
+  - kind: Route
+    apiVersion: v1
+    metadata:
+      name: ${NAME}-green-route
+    spec:
+      host: ${NAME}-green-route-${UNIQUE_ID}.${APP_TLD}
+      to:
+        kind: Service
+        name: ${NAME}-green-svc
+  - kind: Route
+    apiVersion: v1
+    metadata:
+      name: ${NAME}-active-route
+    spec:
+      host: ${NAME}-active-route-${UNIQUE_ID}.${APP_TLD}
+      alternateBackends:
+      - name: ${NAME}-green-svc
+        weight: 0
+      to:
+        kind: Service
+        name: ${NAME}-blue-svc
+        weight: 100
+  - kind: Service
+    apiVersion: v1
+    metadata:
+      name: ${NAME}-blue-svc
+    spec:
+      ports:
+      - name: web
+        port: 8080
+        targetPort: 8080
+      selector:
+        app: ${NAME}
+        env: blue
+  - kind: Service
+    apiVersion: v1
+    metadata:
+      name: ${NAME}-green-svc
+    spec:
+      ports:
+      - name: web
+        port: 8080
+        targetPort: 8080
+      selector:
+        app: ${NAME}
+        env: green
+  - kind: DeploymentConfig
+    apiVersion: apps.openshift.io/v1
+    metadata:
+      name: ${NAME}-blue-dc
+      labels:
+        app: ${NAME}
+        env: blue
+    spec:
+      strategy:
+        type: Rolling
+      triggers:
+        - type: ConfigChange
+        - type: ImageChange
+          imageChangeParams:
+            automatic: true
+            containerNames:
+            - ${NAME}
+            from:
+              kind: ImageStreamTag
+              name: ${NAME}-is:blue
+      replicas: 1
+      revisionHistoryLimit: 10
+      selector:
+        app: ${NAME}
+        env: blue
+      template:
+        metadata:
+          labels:
+            app: ${NAME}
+            env: blue
+        spec:
+          containers:
+            - name: ${NAME}
+              image: ' '
+              ports:
+                - containerPort: 8080
+                  protocol: TCP
+              env:
+                - name: PORT
+                  value: '8080'
+                - name: NODE_ENV
+                  value: development
+              resources: {}
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File
+              imagePullPolicy: Always
+          restartPolicy: Always
+          terminationGracePeriodSeconds: 30
+          dnsPolicy: ClusterFirst
+          securityContext: {}
+          schedulerName: default-scheduler
+  - kind: DeploymentConfig
+    apiVersion: apps.openshift.io/v1
+    metadata:
+      name: ${NAME}-green-dc
+      labels:
+        app: ${NAME}
+        env: green
+    spec:
+      strategy:
+        type: Rolling
+      triggers:
+        - type: ConfigChange
+        - type: ImageChange
+          imageChangeParams:
+            automatic: true
+            containerNames:
+            - ${NAME}
+            from:
+              kind: ImageStreamTag
+              name: ${NAME}-is:green
+      replicas: 1
+      revisionHistoryLimit: 10
+      selector:
+        app: ${NAME}
+        env: green
+      template:
+        metadata:
+          labels:
+            app: ${NAME}
+            env: green
+        spec:
+          containers:
+            - name: ${NAME}
+              image: ' '
+              ports:
+                - containerPort: 8080
+                  protocol: TCP
+              env:
+                - name: PORT
+                  value: '8080'
+                - name: NODE_ENV
+                  value: development
+              resources: {}
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File
+              imagePullPolicy: Always
+          restartPolicy: Always
+          terminationGracePeriodSeconds: 30
+          dnsPolicy: ClusterFirst
+          securityContext: {}
+          schedulerName: default-scheduler
+  - kind: ImageStream
+    apiVersion: image.openshift.io/v1
+    metadata:
+      name: ${NAME}-is
+      labels:
+        app: ${NAME}
+    spec:
+      lookupPolicy:
+        local: false
+  - kind: Secret
+    apiVersion: v1
+    metadata:
+      name: jenkins-persistent-secret
+    data:
+      parameters: >-
+        eyJKRU5LSU5TX0FETUlOX0VNQUlMIjoieW91QGVtYWlsLmNvbSIsIkpFTktJTlNfVExEIjoiMTAuMC4wLjEubmlwLmlvIiwiSkVOS0lOU19JRCI6IiIsIkVOQUJMRV9GQVRBTF9FUlJPUl9MT0dfRklMRSI6ImZhbHNlIiwiSkVOS0lOU19JTUFHRV9TVFJFQU1fVEFHIjoiamVua2luczoyIiwiSk5MUF9TRVJWSUNFX05BTUUiOiJqZW5raW5zLWpubHAiLCJESVNBQkxFX0FETUlOSVNUUkFUSVZFX01PTklUT1JTIjoiZmFsc2UiLCJFTkFCTEVfT0FVVEgiOiJ0cnVlIiwiSU5TVEFMTF9QTFVHSU5TIjoiY2xvdWRiZWVzLWZvbGRlcjo2LjEwLjAsd29ya2Zsb3ctam9iOjIuMzYsYnJhbmNoLWFwaToyLjUuNSxtYXRyaXgtcHJvamVjdDoxLjE0LGphY2tzb24yLWFwaToyLjEwLjEsb3BlbnNoaWZ0LWNsaWVudDoxLjAuMzIsd29ya2Zsb3ctY3BzOjIuNzcsd29ya2Zsb3ctc3VwcG9ydDozLjMsZ2l0OjQuMC4wLHdvcmtmbG93LXNjbS1zdGVwOjIuOSxzdWJ2ZXJzaW9uOjIuMTIuMixkaXNwbGF5LXVybC1hcGk6Mi4zLjIsanVuaXQ6MS4yOCxqaXJhOjMuMC4xMSxodG1scHVibGlzaGVyOjEuMjEscGFtLWF1dGg6MS42LHNjcmlwdC1zZWN1cml0eToxLjY4LGFudDoxLjEwIiwiTUVNT1JZX0xJTUlUIjoiMUdpIiwiSkVOS0lOU19TRVJWSUNFX05BTUUiOiJqZW5raW5zIiwiVk9MVU1FX0NBUEFDSVRZIjoiMUdpIn0=
+    type: Opaque
+  - kind: ServiceInstance
+    apiVersion: servicecatalog.k8s.io/v1beta1
+    metadata:
+      name: jenkins-persistent-si
+      finalizers:
+        - kubernetes-incubator/service-catalog
+    spec:
+      clusterServiceClassExternalName: icheko-jenkins-persistent-v2
+      clusterServicePlanExternalName: default
+      parametersFrom:
+        - secretKeyRef:
+            name: jenkins-persistent-secret
+            key: parameters
+      userInfo:
+        username: user11
+        uid: ''
+        groups:
+          - 'system:authenticated:oauth'
+          - 'system:authenticated'
+        extra:
+          scopes.authorization.openshift.io:
+            - 'user:full'
+parameters:
+- description: The name assigned to all of the frontend objects defined in this template.
+  displayName: Name
+  name: NAME
+  required: true
+  value: angular-app
+- description: The URL of the repository with your application source code.
+  displayName: Git Repository URL
+  name: SOURCE_REPOSITORY_URL
+  required: true
+  value: https://github.com/icheko/angular-sample-app
+- description: The branch in the repository to use.
+  displayName: Git Repository Branch
+  name: SOURCE_REPOSITORY_REF
+  required: true
+  value: master
+- description: The personal access token to use for Github
+  displayName: Git Repository Secret
+  name: SOURCE_REPOSITORY_SECRET
+- description: A custom top level domain to access the instance. You can enter your cluster wildcard domain ex. apps.mydomain.com
+  displayName: App Top Level Domain
+  name: APP_TLD
+  required: true
+- description: Unique instance ID
+  name: UNIQUE_ID
+  generate: expression
+  from: "[a-z0-9]{5}"
